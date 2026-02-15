@@ -7,6 +7,16 @@ import pandas as pd
 
 
 # =========================================================
+# PATH CONFIG
+# =========================================================
+
+CLEANED_TEXT_DIR = "data/cleaned_text"
+STRUCTURED_DIR = "data/structured"
+
+os.makedirs(STRUCTURED_DIR, exist_ok=True)
+
+
+# =========================================================
 # 1. METADATA EXTRACTION
 # =========================================================
 
@@ -21,16 +31,13 @@ def extract_metadata_from_filename(filepath):
         date_str = match.group(3)
         date_obj = datetime.strptime(date_str, "%d-%m-%Y")
     else:
-        lok_sabha_number = None
-        session_number = None
-        date_obj = None
-        date_str = None
+        return None
 
     return {
-        "debate_id": f"{lok_sabha_number}_{session_number}_{date_str}" if date_str else None,
-        "date": date_obj.strftime("%Y-%m-%d") if date_obj else None,
-        "year": date_obj.year if date_obj else None,
-        "month": date_obj.month if date_obj else None,
+        "debate_id": f"{lok_sabha_number}_{session_number}_{date_str}",
+        "date": date_obj.strftime("%Y-%m-%d"),
+        "year": date_obj.year,
+        "month": date_obj.month,
         "lok_sabha_number": lok_sabha_number,
         "session_number": session_number,
         "source_file": filename
@@ -38,20 +45,17 @@ def extract_metadata_from_filename(filepath):
 
 
 # =========================================================
-# 2. GLOBAL CLEANING (WITH ENCODING FIX)
+# 2. GLOBAL CLEANING
 # =========================================================
 
 def clean_global_text(text):
 
-    # Normalize unicode
     text = unicodedata.normalize("NFKC", text)
 
-    # Remove common PDF artifacts
     text = re.sub(r'[�]', '', text)
     text = re.sub(r'\u200b', '', text)
     text = re.sub(r'\xa0', ' ', text)
 
-    # Remove footer lines safely (no truncation)
     text = re.sub(r'©\s*\d{4}.*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'INTERNET\s+.*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'LIVE TELECAST.*$', '', text, flags=re.MULTILINE)
@@ -60,17 +64,16 @@ def clean_global_text(text):
     return text
 
 
-
 # =========================================================
 # 3. SPEAKER DETECTION
 # =========================================================
 
 SPEAKER_PATTERN = re.compile(
     r'^(?P<speaker>'
-    r'(HON\. SPEAKER|SECRETARY[- ]GENERAL|'
-    r'(SHRI|SHRIMATI|DR\.)\s+[A-Z][A-Z\s\.\-\(\)]*|'
-    r'THE MINISTER OF [A-Z ,;\-\(\)]*'
-    r'(?:\n\([A-Z\s\.]+\))?'
+    r'(HON\. SPEAKER|HON\. CHAIRPERSON|SECRETARY[- ]GENERAL|'
+    r'(?:SHRI|SHRIMATI|DR\.)\s+[A-Z][A-Z\s\.\-\(\)]*|'
+    r'THE[\sA-Z,\-&’\.]*MINISTER[\sA-Z,\-&’\.]*'
+    r'(?:\([A-Z\s\.]+\))?'
     r')'
     r')\s*:',
     re.MULTILINE
@@ -85,47 +88,28 @@ def normalize_speaker(raw_speaker):
 
     speaker = raw_speaker.strip()
 
-    # -------------------------------------------------
-    # 1. Presiding officers
-    # -------------------------------------------------
     if "SPEAKER" in speaker:
         return "HON_SPEAKER"
 
     if "SECRETARY" in speaker:
         return "SECRETARY_GENERAL"
 
-    # -------------------------------------------------
-    # 2. Minister format
-    # Example:
-    # THE MINISTER OF FINANCE ... (SHRIMATI NIRMALA SITHARAMAN)
-    # -------------------------------------------------
-    if speaker.startswith("THE MINISTER OF"):
-
+    if speaker.startswith("THE"):
         paren_match = re.search(r'\(([A-Z\s\.]+)\)', speaker)
         if paren_match:
             name = paren_match.group(1)
             name = re.sub(r'^(SHRI|SHRIMATI|DR\.)\s+', '', name)
-            return name.strip()
+            return re.sub(r'\s+', ' ', name).strip()
 
-    # -------------------------------------------------
-    # 3. Regular MP format
-    # Example:
-    # SHRI VINOD KUMAR SONKAR (KAUSHAMBI)
-    # -------------------------------------------------
-
-    # Remove constituency
-    speaker = re.sub(r'\(.*?\)', '', speaker)
-
-    # Remove titles
+    speaker = re.sub(r'\([^)]*\)', '', speaker)
     speaker = re.sub(r'^(SHRI|SHRIMATI|DR\.)\s+', '', speaker)
-
-    speaker = speaker.strip()
+    speaker = re.sub(r'\s+', ' ', speaker).strip()
 
     return speaker
 
 
 # =========================================================
-# 5. SPEECH SEGMENTATION
+# 5. SEGMENTATION
 # =========================================================
 
 def segment_speeches(text):
@@ -143,29 +127,11 @@ def segment_speeches(text):
 
         speech_text = text[start:end].strip()
 
-        # Remove interruptions
-        speech_text = re.sub(
-            r'\(.*?Interrupt.*?\)',
-            '',
-            speech_text,
-            flags=re.IGNORECASE
-        )
-
-        # Remove stray footnote stars
         speech_text = re.sub(r'\*+', '', speech_text)
-
-        # Remove time markers
-        speech_text = re.sub(
-            r'\d{1,2}\.\d{2}\s*hrs',
-            '',
-            speech_text,
-            flags=re.IGNORECASE
-        )
-
-        # Collapse whitespace
+        speech_text = re.sub(r'\d{1,2}\.\d{2}\s*hrs', '', speech_text, flags=re.IGNORECASE)
         speech_text = re.sub(r'\s+', ' ', speech_text).strip()
 
-        if len(speech_text) < 30:
+        if len(speech_text.split()) < 10:
             continue
 
         speeches.append({
@@ -180,21 +146,24 @@ def segment_speeches(text):
 
 
 # =========================================================
-# 6. BUILD JSON
+# 6. BUILD JSON PER DEBATE
 # =========================================================
 
 def build_json(filepath):
 
+    metadata = extract_metadata_from_filename(filepath)
+    if metadata is None:
+        return None
+
     with open(filepath, "r", encoding="utf-8") as f:
         text = f.read()
 
-    metadata = extract_metadata_from_filename(filepath)
     text = clean_global_text(text)
-
     speeches = segment_speeches(text)
 
     for idx, speech in enumerate(speeches):
         speech["speech_id"] = f"{metadata['debate_id']}_{idx+1:03d}"
+        speech["speech_index"] = idx + 1
         speech["speaker_role"] = None
         speech["is_presiding_officer"] = speech["speaker"] == "HON_SPEAKER"
 
@@ -204,65 +173,76 @@ def build_json(filepath):
 
 
 # =========================================================
-# 7. JSON → DATAFRAME
+# 7. PROCESS LATEST 30 FILES
 # =========================================================
 
-def json_to_dataframe(json_data):
-    df = pd.DataFrame(json_data["speeches"])
+def get_latest_30_files():
 
-    df["date"] = json_data["date"]
-    df["year"] = json_data["year"]
-    df["month"] = json_data["month"]
-    df["lok_sabha_number"] = json_data["lok_sabha_number"]
-    df["session_number"] = json_data["session_number"]
+    files = [
+        os.path.join(CLEANED_TEXT_DIR, f)
+        for f in os.listdir(CLEANED_TEXT_DIR)
+        if f.endswith(".txt")
+    ]
 
-    return df
+    dated_files = []
+
+    for f in files:
+        meta = extract_metadata_from_filename(f)
+        if meta:
+            dated_files.append((f, meta["date"]))
+
+    dated_files.sort(key=lambda x: x[1], reverse=True)
+
+    return [f[0] for f in dated_files[:30]]
 
 
 # =========================================================
-# 8. RUN
+# 8. RUN PIPELINE
 # =========================================================
 
 if __name__ == "__main__":
 
-    filepath = "data/cleaned_text/lsd_17_6_04-08-2021_eng_editorial.txt"
+    latest_files = get_latest_30_files()
 
-    debate_json = build_json(filepath)
+    all_rows = []
 
-    with open("segmented_debate.json", "w", encoding="utf-8") as f:
-        json.dump(debate_json, f, indent=4, ensure_ascii=False)
+    for filepath in latest_files:
 
-    df = json_to_dataframe(debate_json)
-    
-    def display_full_debate(df): 
-        for _, row in df.iterrows(): 
-            print("="*100) 
-            print(f"SPEECH ID: {row['speech_id']}") 
-            print(f"SPEAKER: {row['speaker']}") 
-            print(f"WORD COUNT: {row['word_count']}") 	
-            print("-"*100) 
-            print(row['speech_text']) 
-            print("\n")
-            
-    display_full_debate(df)
+        debate_json = build_json(filepath)
+        if debate_json is None:
+            continue
 
-    print("Unique Canonical Speakers:", df["speaker"].nunique())
-    
-    print("\n=== UNIQUE SPEAKERS ===")
-    for s in sorted(df["speaker"].unique()):
-        print(s)
+        # Save per-debate JSON
+        output_path = os.path.join(
+            STRUCTURED_DIR,
+            debate_json["debate_id"] + ".json"
+        )
 
-    print("\n=== SPEAKER FREQUENCY ===")
-    print(df["speaker"].value_counts())
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(debate_json, f, indent=2, ensure_ascii=False)
 
-    print("\n=== RAW → NORMALIZED ===")
-    print(df[["raw_speaker", "speaker"]].drop_duplicates())
-    
-    with open(filepath, "r", encoding="utf-8") as f:
-        raw = f.read()
-        print("Raw length:", len(raw))
-        cleaned = clean_global_text(raw)
-        print("After cleaning length:", len(cleaned))
-    
+        # Flatten for master dataset
+        for speech in debate_json["speeches"]:
+            row = speech.copy()
+            row.update({
+                "date": debate_json["date"],
+                "year": debate_json["year"],
+                "month": debate_json["month"],
+                "lok_sabha_number": debate_json["lok_sabha_number"],
+                "session_number": debate_json["session_number"],
+                "debate_id": debate_json["debate_id"]
+            })
+            all_rows.append(row)
 
+    # Master DataFrame for NER tagging
+    master_df = pd.DataFrame(all_rows)
 
+    master_df.to_csv(
+        os.path.join(STRUCTURED_DIR, "lok_sabha_latest30_master.csv"),
+        index=False
+    )
+
+    print("Structured JSON files saved.")
+    print("Master dataset created for NER tagging.")
+    print("Total speeches:", len(master_df))
+    print("Unique speakers:", master_df["speaker"].nunique())
