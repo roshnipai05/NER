@@ -1,18 +1,18 @@
 import re
 import json
 import os
+import unicodedata
 from datetime import datetime
 import pandas as pd
 
 
-# ------------------------------
-# 1. Metadata extraction
-# ------------------------------
+# =========================================================
+# 1. METADATA EXTRACTION
+# =========================================================
 
 def extract_metadata_from_filename(filepath):
     filename = os.path.basename(filepath)
 
-    # Example: lsd_17_5_29-01-2021_eng_editorial.txt
     match = re.search(r'lsd_(\d+)_(\d+)_(\d{2}-\d{2}-\d{4})', filename)
 
     if match:
@@ -37,62 +37,140 @@ def extract_metadata_from_filename(filepath):
     }
 
 
-# ------------------------------
-# 2. Remove front matter
-# ------------------------------
+# =========================================================
+# 2. GLOBAL CLEANING (WITH ENCODING FIX)
+# =========================================================
 
-def remove_front_matter(text):
-    # Debate usually begins when actual proceedings start
-    start_pattern = r"LOK SABHA\s*-+\s*Friday"
-    match = re.search(start_pattern, text)
+def clean_global_text(text):
 
-    if match:
-        return text[match.start():]
-    else:
-        return text
+    # Normalize unicode
+    text = unicodedata.normalize("NFKC", text)
+
+    # Remove common PDF artifacts
+    text = re.sub(r'[�]', '', text)
+    text = re.sub(r'\u200b', '', text)
+    text = re.sub(r'\xa0', ' ', text)
+
+    # Remove footer lines safely (no truncation)
+    text = re.sub(r'©\s*\d{4}.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'INTERNET\s+.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'LIVE TELECAST.*$', '', text, flags=re.MULTILINE)
+    text = re.sub(r'Published under Rules.*$', '', text, flags=re.MULTILINE)
+
+    return text
 
 
-# ------------------------------
-# 3. Identify speaker markers
-# ------------------------------
+
+# =========================================================
+# 3. SPEAKER DETECTION
+# =========================================================
 
 SPEAKER_PATTERN = re.compile(
-    r'^(HON\. SPEAKER|SHRI|SHRIMATI|DR\.|SECRETARY-GENERAL|THE MINISTER OF.*?)[:\-]',
+    r'^(?P<speaker>'
+    r'(HON\. SPEAKER|SECRETARY[- ]GENERAL|'
+    r'(SHRI|SHRIMATI|DR\.)\s+[A-Z][A-Z\s\.\-\(\)]*|'
+    r'THE MINISTER OF [A-Z ,;\-\(\)]*'
+    r'(?:\n\([A-Z\s\.]+\))?'
+    r')'
+    r')\s*:',
     re.MULTILINE
 )
 
 
-def segment_speeches(text):
-    matches = list(SPEAKER_PATTERN.finditer(text))
+# =========================================================
+# 4. SPEAKER NORMALIZATION
+# =========================================================
 
+def normalize_speaker(raw_speaker):
+
+    speaker = raw_speaker.strip()
+
+    # -------------------------------------------------
+    # 1. Presiding officers
+    # -------------------------------------------------
+    if "SPEAKER" in speaker:
+        return "HON_SPEAKER"
+
+    if "SECRETARY" in speaker:
+        return "SECRETARY_GENERAL"
+
+    # -------------------------------------------------
+    # 2. Minister format
+    # Example:
+    # THE MINISTER OF FINANCE ... (SHRIMATI NIRMALA SITHARAMAN)
+    # -------------------------------------------------
+    if speaker.startswith("THE MINISTER OF"):
+
+        paren_match = re.search(r'\(([A-Z\s\.]+)\)', speaker)
+        if paren_match:
+            name = paren_match.group(1)
+            name = re.sub(r'^(SHRI|SHRIMATI|DR\.)\s+', '', name)
+            return name.strip()
+
+    # -------------------------------------------------
+    # 3. Regular MP format
+    # Example:
+    # SHRI VINOD KUMAR SONKAR (KAUSHAMBI)
+    # -------------------------------------------------
+
+    # Remove constituency
+    speaker = re.sub(r'\(.*?\)', '', speaker)
+
+    # Remove titles
+    speaker = re.sub(r'^(SHRI|SHRIMATI|DR\.)\s+', '', speaker)
+
+    speaker = speaker.strip()
+
+    return speaker
+
+
+# =========================================================
+# 5. SPEECH SEGMENTATION
+# =========================================================
+
+def segment_speeches(text):
+
+    matches = list(SPEAKER_PATTERN.finditer(text))
     speeches = []
 
     for i, match in enumerate(matches):
-        start = match.start()
+
+        raw_speaker = match.group("speaker").strip()
+        normalized_speaker = normalize_speaker(raw_speaker)
+
+        start = match.end()
         end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
 
-        speech_block = text[start:end].strip()
-
-        # Extract speaker line
-        first_line = speech_block.split('\n')[0]
-
-        # Clean speaker name
-        speaker = re.sub(r'[:\-]', '', first_line).strip()
-
-        # Extract speech text (remove first line)
-        speech_text = '\n'.join(speech_block.split('\n')[1:]).strip()
+        speech_text = text[start:end].strip()
 
         # Remove interruptions
-        speech_text = re.sub(r'\(Interruptions.*?\)', '', speech_text)
-        speech_text = re.sub(r'\*.*?\*', '', speech_text)
+        speech_text = re.sub(
+            r'\(.*?Interrupt.*?\)',
+            '',
+            speech_text,
+            flags=re.IGNORECASE
+        )
 
+        # Remove stray footnote stars
+        speech_text = re.sub(r'\*+', '', speech_text)
+
+        # Remove time markers
+        speech_text = re.sub(
+            r'\d{1,2}\.\d{2}\s*hrs',
+            '',
+            speech_text,
+            flags=re.IGNORECASE
+        )
+
+        # Collapse whitespace
         speech_text = re.sub(r'\s+', ' ', speech_text).strip()
 
-        if len(speech_text) < 20:
-            continue  # discard trivial segments
+        if len(speech_text) < 30:
+            continue
 
         speeches.append({
-            "speaker": speaker,
+            "raw_speaker": raw_speaker,
+            "speaker": normalized_speaker,
             "speech_text": speech_text,
             "word_count": len(speech_text.split()),
             "char_count": len(speech_text)
@@ -101,58 +179,90 @@ def segment_speeches(text):
     return speeches
 
 
-# ------------------------------
-# 4. Build JSON structure
-# ------------------------------
+# =========================================================
+# 6. BUILD JSON
+# =========================================================
 
 def build_json(filepath):
+
     with open(filepath, "r", encoding="utf-8") as f:
         text = f.read()
 
     metadata = extract_metadata_from_filename(filepath)
-
-    text = remove_front_matter(text)
+    text = clean_global_text(text)
 
     speeches = segment_speeches(text)
 
-    # Add speech IDs
     for idx, speech in enumerate(speeches):
         speech["speech_id"] = f"{metadata['debate_id']}_{idx+1:03d}"
         speech["speaker_role"] = None
-        speech["is_presiding_officer"] = "SPEAKER" in speech["speaker"]
+        speech["is_presiding_officer"] = speech["speaker"] == "HON_SPEAKER"
 
     metadata["speeches"] = speeches
 
     return metadata
 
 
-# ------------------------------
-# 5. Convert JSON to DataFrame
-# ------------------------------
+# =========================================================
+# 7. JSON → DATAFRAME
+# =========================================================
 
 def json_to_dataframe(json_data):
     df = pd.DataFrame(json_data["speeches"])
+
     df["date"] = json_data["date"]
     df["year"] = json_data["year"]
     df["month"] = json_data["month"]
     df["lok_sabha_number"] = json_data["lok_sabha_number"]
     df["session_number"] = json_data["session_number"]
+
     return df
 
 
-# ------------------------------
-# 6. Example usage
-# ------------------------------
+# =========================================================
+# 8. RUN
+# =========================================================
 
-filepath = "/mnt/data/lsd_17_5_29-01-2021_eng_editorial.txt"
+if __name__ == "__main__":
 
-debate_json = build_json(filepath)
+    filepath = "data/cleaned_text/lsd_17_6_04-08-2021_eng_editorial.txt"
 
-# Save JSON
-with open("segmented_debate.json", "w", encoding="utf-8") as f:
-    json.dump(debate_json, f, indent=4, ensure_ascii=False)
+    debate_json = build_json(filepath)
 
-# Convert to DataFrame
-df = json_to_dataframe(debate_json)
+    with open("segmented_debate.json", "w", encoding="utf-8") as f:
+        json.dump(debate_json, f, indent=4, ensure_ascii=False)
 
-print(df.head())
+    df = json_to_dataframe(debate_json)
+    
+    def display_full_debate(df): 
+        for _, row in df.iterrows(): 
+            print("="*100) 
+            print(f"SPEECH ID: {row['speech_id']}") 
+            print(f"SPEAKER: {row['speaker']}") 
+            print(f"WORD COUNT: {row['word_count']}") 	
+            print("-"*100) 
+            print(row['speech_text']) 
+            print("\n")
+            
+    display_full_debate(df)
+
+    print("Unique Canonical Speakers:", df["speaker"].nunique())
+    
+    print("\n=== UNIQUE SPEAKERS ===")
+    for s in sorted(df["speaker"].unique()):
+        print(s)
+
+    print("\n=== SPEAKER FREQUENCY ===")
+    print(df["speaker"].value_counts())
+
+    print("\n=== RAW → NORMALIZED ===")
+    print(df[["raw_speaker", "speaker"]].drop_duplicates())
+    
+    with open(filepath, "r", encoding="utf-8") as f:
+        raw = f.read()
+        print("Raw length:", len(raw))
+        cleaned = clean_global_text(raw)
+        print("After cleaning length:", len(cleaned))
+    
+
+
